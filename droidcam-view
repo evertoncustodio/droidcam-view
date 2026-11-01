@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""DroidCam viewer: connect to the phone, rotate/flip the picture, show a live
+preview and feed the result to the v4l2loopback virtual camera.
+
+Usage: droidcam-view [--connect]
+"""
+import fcntl
+import glob
+import json
+import os
+import struct
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gst", "1.0")
+from gi.repository import Adw, GLib, Gst, Gtk  # noqa: E402
+
+APP_ID = "local.droidcam.View"
+CONFIG = os.path.join(GLib.get_user_config_dir(), "droidcam-view.json")
+DEFAULTS = {
+    "ip": "",
+    "port": 4747,
+    "rotation": 0,
+    "mirror": False,
+    "vflip": False,
+    "zoom": 1.0,
+    "shape": "Original",
+    # Point of the phone's picture shown in the middle, as fractions of its size.
+    "center_x": 0.5,
+    "center_y": 0.5,
+}
+
+# Camera created by the droidcam-rotate script; never use it as our output.
+ROTATE_SCRIPT_CAMERA = "DroidCam Rotated"
+
+ROTATION_METHOD = {0: "none", 90: "clockwise", 180: "rotate-180", 270: "counterclockwise"}
+RECONNECT_DELAY_MS = 400
+ZOOM_MAX = 4.0
+ZOOM_STEP = 0.5
+# The phone's free MJPEG feed stamps "DroidCam Video Feed - <date>" along the
+# top edge (11 of 480 rows); this share of the height is always cropped off.
+STAMP_HEIGHT = 0.03
+# Output shapes (width / height, as seen after rotating); None keeps the phone's.
+SHAPES = {"Original": None, "16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "3:4": 3 / 4, "9:16": 9 / 16}
+
+VIDIOC_S_CTRL = 0xC008561C
+CID_KEEP_FORMAT = 0x0098F900  # v4l2loopback private control
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    if cfg["rotation"] not in ROTATION_METHOD:
+        cfg["rotation"] = 0
+    try:
+        cfg["zoom"] = min(max(float(cfg["zoom"]), 1.0), ZOOM_MAX)
+    except (TypeError, ValueError):
+        cfg["zoom"] = 1.0
+    if cfg["shape"] not in SHAPES:
+        cfg["shape"] = "Original"
+    for key in ("center_x", "center_y"):
+        try:
+            cfg[key] = min(max(float(cfg[key]), 0.0), 1.0)
+        except (TypeError, ValueError):
+            cfg[key] = 0.5
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+
+def find_virtual_camera():
+    """Return (device, name) of the first v4l2loopback camera, or None."""
+    for path in sorted(glob.glob("/sys/devices/virtual/video4linux/video*")):
+        try:
+            with open(os.path.join(path, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if name != ROTATE_SCRIPT_CAMERA:
+            return "/dev/" + os.path.basename(path), name
+    return None
+
+
+def release_format_lock(device):
+    """Clear v4l2loopback's keep_format control.
+
+    The official DroidCam client leaves it set, which pins the camera to the
+    last picture size and makes it refuse a rotated stream.
+    """
+    try:
+        fd = os.open(device, os.O_RDWR)
+    except OSError:
+        return
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_CTRL, struct.pack("Ii", CID_KEEP_FORMAT, 0))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def even(value):
+    return int(value / 2) * 2
+
+
+def screen_to_source(dx, dy, rotation, mirror, vflip):
+    """Turn a movement on screen into the same movement in the phone's picture,
+    undoing the flips and then the rotation, which come after the crop."""
+    if mirror:
+        dx = -dx
+    if vflip:
+        dy = -dy
+    if rotation == 90:
+        return dy, -dx
+    if rotation == 180:
+        return -dx, -dy
+    if rotation == 270:
+        return -dy, dx
+    return dx, dy
+
+
+def flip_method(mirror, vflip):
+    if mirror and vflip:
+        return "rotate-180"
+    if mirror:
+        return "horizontal-flip"
+    if vflip:
+        return "vertical-flip"
+    return "none"
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, autoconnect):
+        super().__init__(application=app, title="DroidCam", default_width=720, default_height=640)
+        self.cfg = load_config()
+        self.pipeline = None
+        self.restart_id = 0
+        self.frame_size = None
+        self.crop_scale = 1.0
+        self.drag_start = None
+
+        header = Adw.HeaderBar()
+        for icon, tip, delta in (
+            ("object-rotate-left-symbolic", "Rotate left", -90),
+            ("object-rotate-right-symbolic", "Rotate right", 90),
+        ):
+            button = Gtk.Button(icon_name=icon, tooltip_text=tip)
+            button.connect("clicked", self.on_rotate, delta)
+            header.pack_start(button)
+        self.mirror_button = Gtk.ToggleButton(
+            icon_name="object-flip-horizontal-symbolic", tooltip_text="Mirror", active=self.cfg["mirror"]
+        )
+        self.vflip_button = Gtk.ToggleButton(
+            icon_name="object-flip-vertical-symbolic", tooltip_text="Flip vertically", active=self.cfg["vflip"]
+        )
+        for button in (self.mirror_button, self.vflip_button):
+            button.connect("toggled", self.on_flip)
+            header.pack_start(button)
+
+        zoom_out = Gtk.Button(icon_name="zoom-out-symbolic", tooltip_text="Zoom out")
+        zoom_out.connect("clicked", self.on_zoom, -ZOOM_STEP)
+        zoom_in = Gtk.Button(icon_name="zoom-in-symbolic", tooltip_text="Zoom in")
+        zoom_in.connect("clicked", self.on_zoom, ZOOM_STEP)
+        self.zoom_button = Gtk.Button(tooltip_text="Reset zoom and framing")
+        self.zoom_button.connect("clicked", self.on_zoom, None)
+        zoom_box = Gtk.Box()
+        zoom_box.add_css_class("linked")
+        for button in (zoom_out, self.zoom_button, zoom_in):
+            zoom_box.append(button)
+        header.pack_start(zoom_box)
+        self.update_zoom_label()
+
+        names = list(SHAPES)
+        self.shape_dropdown = Gtk.DropDown.new_from_strings(names)
+        self.shape_dropdown.set_tooltip_text("Picture shape")
+        self.shape_dropdown.set_selected(names.index(self.cfg["shape"]))
+        self.shape_dropdown.connect("notify::selected", self.on_shape)
+        header.pack_end(self.shape_dropdown)
+
+        self.picture = Gtk.Picture(
+            can_shrink=True, tooltip_text="Zoom in, then drag to adjust the framing. Double-click to centre."
+        )
+        self.picture.set_cursor_from_name("grab")
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_drag_begin)
+        drag.connect("drag-update", self.on_drag_update)
+        drag.connect("drag-end", self.on_drag_end)
+        self.picture.add_controller(drag)
+        double_click = Gtk.GestureClick()
+        double_click.connect("pressed", self.on_picture_pressed)
+        self.picture.add_controller(double_click)
+        self.idle_page = Adw.StatusPage(icon_name="camera-web-symbolic", title="Not connected")
+        self.stack = Gtk.Stack()
+        self.stack.add_named(self.idle_page, "idle")
+        self.stack.add_named(self.picture, "video")
+        self.toasts = Adw.ToastOverlay(child=self.stack)
+
+        self.ip_entry = Gtk.Entry(text=self.cfg["ip"], placeholder_text="Phone IP", width_chars=16)
+        self.port_entry = Gtk.Entry(text=str(self.cfg["port"]), placeholder_text="Port", width_chars=6)
+        self.connect_button = Gtk.Button(label="Connect")
+        self.connect_button.add_css_class("suggested-action")
+        self.connect_button.connect("clicked", self.on_connect_clicked)
+        self.ip_entry.connect("activate", self.on_connect_clicked)
+        self.port_entry.connect("activate", self.on_connect_clicked)
+        self.camera_label = Gtk.Label(ellipsize=3)
+        self.camera_label.add_css_class("dim-label")
+        bar = Gtk.ActionBar()
+        bar.pack_start(self.ip_entry)
+        bar.pack_start(self.port_entry)
+        bar.pack_start(self.camera_label)
+        bar.pack_end(self.connect_button)
+
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(header)
+        view.add_bottom_bar(bar)
+        self.set_content(view)
+
+        self.connect("close-request", self.on_close)
+        self.update_idle_text()
+        if autoconnect:
+            self.start()
+
+    # --- UI helpers -------------------------------------------------------
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text))
+
+    def update_idle_text(self):
+        camera = find_virtual_camera()
+        if camera:
+            self.camera_label.set_text(f"Virtual camera: {camera[1]}")
+            self.idle_page.set_description("Open DroidCam on the phone, enter its IP and press Connect.")
+        else:
+            self.camera_label.set_text("No virtual camera (preview only)")
+            self.idle_page.set_description(
+                "Open DroidCam on the phone, enter its IP and press Connect.\n"
+                "The v4l2loopback module is not loaded, so other apps will not see the camera."
+            )
+
+    def set_connected(self, connected):
+        self.connect_button.set_label("Disconnect" if connected else "Connect")
+        if connected:
+            self.connect_button.remove_css_class("suggested-action")
+            self.connect_button.add_css_class("destructive-action")
+        else:
+            self.connect_button.remove_css_class("destructive-action")
+            self.connect_button.add_css_class("suggested-action")
+        self.ip_entry.set_sensitive(not connected)
+        self.port_entry.set_sensitive(not connected)
+        self.stack.set_visible_child_name("video" if connected else "idle")
+
+    # --- Stream -----------------------------------------------------------
+
+    def start(self):
+        ip = self.ip_entry.get_text().strip()
+        try:
+            port = int(self.port_entry.get_text().strip())
+        except ValueError:
+            port = 0
+        if not ip or any(c.isspace() or c in '"/' for c in ip) or not 0 < port < 65536:
+            self.toast("Enter the phone's IP address and port")
+            return
+        self.cfg["ip"], self.cfg["port"] = ip, port
+        save_config(self.cfg)
+
+        branch = "queue leaky=downstream max-size-buffers=2 ! videoconvert"
+        desc = (
+            f'souphttpsrc location="http://{ip}:{port}/video" is-live=true do-timestamp=true timeout=5 '
+            "! multipartdemux ! jpegdec ! videoconvert "
+            "! videocrop name=zoom ! videoscale ! capsfilter name=zoomcaps "
+            f'! videoflip name=rotate method={ROTATION_METHOD[self.cfg["rotation"]]} '
+            f'! videoflip name=flip method={flip_method(self.cfg["mirror"], self.cfg["vflip"])} '
+            "! tee name=t "
+            f"t. ! {branch} ! gtk4paintablesink name=preview sync=false "
+        )
+        camera = find_virtual_camera()
+        if camera:
+            release_format_lock(camera[0])
+            desc += f"t. ! {branch} ! video/x-raw,format=YUY2 ! v4l2sink device={camera[0]} sync=false"
+        try:
+            self.pipeline = Gst.parse_launch(desc)
+        except GLib.Error as e:
+            self.pipeline = None
+            self.toast(f"Could not start: {e.message}")
+            return
+
+        self.picture.set_paintable(self.pipeline.get_by_name("preview").get_property("paintable"))
+        self.frame_size = None
+        self.pipeline.get_by_name("zoom").get_static_pad("sink").connect("notify::caps", self.on_source_caps)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_error)
+        bus.connect("message::eos", self.on_eos)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.set_connected(True)
+
+    def stop(self):
+        if self.restart_id:
+            GLib.source_remove(self.restart_id)
+            self.restart_id = 0
+        if self.pipeline:
+            self.pipeline.get_bus().remove_signal_watch()
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        self.picture.set_paintable(None)
+        self.set_connected(False)
+        self.update_idle_text()
+
+    def on_source_caps(self, pad, _pspec):
+        """Called from the streaming thread once the phone's picture size is known."""
+        caps = pad.get_current_caps()
+        if caps:
+            structure = caps.get_structure(0)
+            GLib.idle_add(self.set_frame_size, structure.get_value("width"), structure.get_value("height"))
+
+    def set_frame_size(self, width, height):
+        if self.pipeline and width and height and self.frame_size != (width, height):
+            self.frame_size = (width, height)
+            # Scale the cropped picture back up, so zooming never changes the output size.
+            out_w, out_h = self.output_size()
+            caps = Gst.Caps.from_string(f"video/x-raw,width={out_w},height={out_h},pixel-aspect-ratio=1/1")
+            self.pipeline.get_by_name("zoomcaps").set_property("caps", caps)
+            self.apply_zoom()
+        return GLib.SOURCE_REMOVE
+
+    def crop_area(self):
+        """Largest window of the chosen shape below the date stamp, in the
+        phone's own orientation: (width, height, stamp height)."""
+        width, height = self.frame_size
+        stamp = even(height * STAMP_HEIGHT + 2)
+        ratio = SHAPES[self.cfg["shape"]]
+        if ratio is None:
+            ratio = width / height
+        elif self.cfg["rotation"] in (90, 270):
+            ratio = 1 / ratio
+        area_w = min(width, (height - stamp) * ratio)
+        return area_w, area_w / ratio, stamp
+
+    def output_size(self):
+        """Size of the picture sent on, before rotation."""
+        if SHAPES[self.cfg["shape"]] is None:
+            return self.frame_size
+        area_w, area_h, _stamp = self.crop_area()
+        return even(area_w), even(area_h)
+
+    def apply_zoom(self):
+        if not self.pipeline or not self.frame_size:
+            return
+        width, height = self.frame_size
+        # A window of the chosen shape, below the date stamp and shrunk by the
+        # zoom level. Its size depends only on the zoom, so moving it around
+        # never renegotiates the stream.
+        area_w, area_h, stamp = self.crop_area()
+        crop_h = even(area_h / self.cfg["zoom"])
+        crop_w = min(width, even(crop_h * area_w / area_h))
+        self.crop_scale = crop_w / self.output_size()[0]
+
+        # Centre the window on the chosen point, keeping it inside the picture.
+        cx = min(max(self.cfg["center_x"] * width, crop_w / 2), width - crop_w / 2)
+        cy = min(max(self.cfg["center_y"] * height, stamp + crop_h / 2), height - crop_h / 2)
+        self.cfg["center_x"], self.cfg["center_y"] = cx / width, cy / height
+        left = int((cx - crop_w / 2) / 2) * 2
+        top = max(int((cy - crop_h / 2) / 2) * 2, stamp)
+        crop = self.pipeline.get_by_name("zoom")
+        for side, value in (
+            ("left", left),
+            ("right", width - left - crop_w),
+            ("top", top),
+            ("bottom", height - top - crop_h),
+        ):
+            crop.set_property(side, value)
+
+    def restart(self):
+        """Reconnect; needed when the picture size changes (90 degree turns)."""
+        self.stop()
+        self.set_connected(True)
+        self.restart_id = GLib.timeout_add(RECONNECT_DELAY_MS, self.on_restart_timeout)
+
+    def on_restart_timeout(self):
+        self.restart_id = 0
+        self.set_connected(False)
+        self.start()
+        return GLib.SOURCE_REMOVE
+
+    def on_error(self, _bus, message):
+        err, _debug = message.parse_error()
+        source = message.src.get_name() if message.src else ""
+        self.stop()
+        if source.startswith("souphttpsrc"):
+            self.toast(f"Could not reach the phone: {err.message}")
+        elif source.startswith("v4l2sink"):
+            self.toast(f"Virtual camera error: {err.message}")
+        else:
+            self.toast(err.message)
+
+    def on_eos(self, _bus, _message):
+        self.stop()
+        self.toast("The phone ended the stream")
+
+    # --- Signal handlers --------------------------------------------------
+
+    def on_connect_clicked(self, _widget):
+        if self.pipeline or self.restart_id:
+            self.stop()
+        else:
+            self.start()
+
+    def on_rotate(self, _button, delta):
+        self.cfg["rotation"] = (self.cfg["rotation"] + delta) % 360
+        save_config(self.cfg)
+        if self.pipeline:
+            self.restart()
+
+    def on_flip(self, _button):
+        self.cfg["mirror"] = self.mirror_button.get_active()
+        self.cfg["vflip"] = self.vflip_button.get_active()
+        save_config(self.cfg)
+        if self.pipeline:
+            Gst.util_set_object_arg(
+                self.pipeline.get_by_name("flip"), "method", flip_method(self.cfg["mirror"], self.cfg["vflip"])
+            )
+
+    def on_zoom(self, _button, delta):
+        if delta is None:
+            self.cfg["zoom"] = 1.0
+            self.cfg["center_x"] = self.cfg["center_y"] = 0.5
+        else:
+            self.cfg["zoom"] = min(max(self.cfg["zoom"] + delta, 1.0), ZOOM_MAX)
+        save_config(self.cfg)
+        self.update_zoom_label()
+        self.apply_zoom()
+
+    def on_shape(self, dropdown, _pspec):
+        self.cfg["shape"] = list(SHAPES)[dropdown.get_selected()]
+        save_config(self.cfg)
+        # The output size changes, which needs a fresh stream like a 90° turn.
+        if self.pipeline:
+            self.restart()
+
+    def on_drag_begin(self, _gesture, _x, _y):
+        self.drag_start = (self.cfg["center_x"], self.cfg["center_y"])
+
+    def on_drag_update(self, _gesture, dx, dy):
+        paintable = self.picture.get_paintable()
+        if not self.drag_start or not self.frame_size or not paintable:
+            return
+        out_w, out_h = paintable.get_intrinsic_width(), paintable.get_intrinsic_height()
+        if not out_w or not out_h:
+            return
+        # Screen pixels per output pixel, as the preview is scaled to fit.
+        shown = min(self.picture.get_width() / out_w, self.picture.get_height() / out_h)
+        sx, sy = screen_to_source(dx, dy, self.cfg["rotation"], self.cfg["mirror"], self.cfg["vflip"])
+        width, height = self.frame_size
+        # The picture follows the pointer, so the window moves the other way.
+        factor = self.crop_scale / shown
+        self.cfg["center_x"] = self.drag_start[0] - sx * factor / width
+        self.cfg["center_y"] = self.drag_start[1] - sy * factor / height
+        self.apply_zoom()
+
+    def on_drag_end(self, _gesture, _dx, _dy):
+        self.drag_start = None
+        save_config(self.cfg)
+
+    def on_picture_pressed(self, _gesture, n_press, _x, _y):
+        if n_press == 2:
+            self.cfg["center_x"] = self.cfg["center_y"] = 0.5
+            save_config(self.cfg)
+            self.apply_zoom()
+
+    def update_zoom_label(self):
+        self.zoom_button.set_label(f"{self.cfg['zoom']:g}×")
+
+    def on_close(self, _window):
+        self.stop()
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self, autoconnect):
+        super().__init__(application_id=APP_ID)
+        self.autoconnect = autoconnect
+
+    def do_activate(self):
+        window = self.props.active_window or Window(self, self.autoconnect)
+        window.present()
+
+
+def main():
+    args = sys.argv[1:]
+    autoconnect = "--connect" in args
+    Gst.init(None)
+    return App(autoconnect).run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
